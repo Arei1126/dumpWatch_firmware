@@ -1,0 +1,117 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <nrf_soc.h>
+#include <nrf_gpio.h>
+
+namespace {
+constexpr uint8_t kImuAddress = 0x6A;
+constexpr uint8_t kImuInt1Pin = PIN_LSM6DS3TR_C_INT1;
+
+// XIAO nRF52840 Sense の IMU電源制御ピン
+#if defined(PIN_LSM6DS3TR_C_PWR)
+constexpr uint8_t kImuPwrPin = PIN_LSM6DS3TR_C_PWR;
+#else
+// 定義がない場合は P1.00 (Arduinoピン番号 32 相当)
+constexpr uint8_t kImuPwrPin = 32;
+#endif
+
+void writeImuRegister(uint8_t reg, uint8_t value) {
+	Wire.beginTransmission(kImuAddress);
+	Wire.write(reg);
+	Wire.write(value);
+	Wire.endTransmission();
+}
+
+uint8_t readImuRegister(uint8_t reg) {
+	Wire.beginTransmission(kImuAddress);
+	Wire.write(reg);
+	Wire.endTransmission(false);
+	Wire.requestFrom(kImuAddress, static_cast<uint8_t>(1));
+	return Wire.available() ? Wire.read() : 0;
+}
+
+void initializeImu() {
+	// ★ 1. IMUへの電源供給を確実にONにする
+	pinMode(kImuPwrPin, OUTPUT);
+	digitalWrite(kImuPwrPin, HIGH);
+	delay(20); // 電源安定待ち
+
+	pinMode(kImuInt1Pin, INPUT);
+
+	// 2. 加速度センサ有効化: 208 Hz, +/-2 g
+	writeImuRegister(0x10, 0x50);
+
+	// 3. TAP_CFG (0x58): 全軸有効 + 割り込みラッチ(LIR)有効
+	writeImuRegister(0x58, 0x8F);
+
+	// 4. TAP_THS_6D (0x59): 感度を敏感寄りに調整 (0x04 〜 0x05)
+	writeImuRegister(0x59, 0x04);
+
+	// 5. INT_DUR2 (0x5A): ダブルタップのインターバルを長めに確保 (0x7F)
+	//    [SHOCK 2bit: 11] [QUIET 2bit: 11] [DUR 4bit: 1111]
+	writeImuRegister(0x5A, 0x7F);
+
+	// 6. WAKEUP_DUR (0x5B): Bit 7 を 1 にしてダブルタップ判定を有効化
+	writeImuRegister(0x5B, 0x80);
+
+	// 7. MD1_CFG (0x5E): INT1にダブルタップをルーティング
+	writeImuRegister(0x5E, 0x10);
+
+	// 既存フラグをクリア
+	readImuRegister(0x53);
+}
+
+void enterSystemOff() {
+	Serial.println(F("Entering System OFF..."));
+	Serial.flush();
+	delay(100);
+
+	// System OFF中もIMUに電源を供給し続けるためピンを出力High維持
+	uint32_t pwrPhysicalPin = g_ADigitalPinMap[kImuPwrPin];
+	nrf_gpio_cfg_output(pwrPhysicalPin);
+	nrf_gpio_pin_set(pwrPhysicalPin);
+
+	// INT1ピンをSENSE HIGHに設定
+	uint32_t intPhysicalPin = g_ADigitalPinMap[kImuInt1Pin];
+	nrf_gpio_cfg_sense_input(intPhysicalPin,
+				 NRF_GPIO_PIN_PULLDOWN,
+				 NRF_GPIO_PIN_SENSE_HIGH);
+
+	sd_power_system_off();
+
+	while (true) {
+		__WFE();
+	}
+}
+}  // namespace
+
+void setup() {
+	Serial.begin(115200);
+	while (!Serial && millis() < 3000) {
+	}
+
+	delay(2000);
+	Serial.println(F("\n--- Booted / Wakeup from System OFF ---"));
+
+	Wire.begin();
+	Wire.setClock(400000);
+	initializeImu();
+
+	Serial.println(F("Try double tapping now! Sleep in 8 seconds."));
+}
+
+void loop() {
+	if (digitalRead(kImuInt1Pin) == HIGH) {
+		Serial.println(F(">>> Tap interrupt detected on INT1! <<<"));
+		uint8_t tapSrc = readImuRegister(0x53);
+		Serial.print(F("TAP_SRC register: 0x"));
+		Serial.println(tapSrc, HEX);
+		delay(200);
+	}
+
+	if (millis() > 8000) {
+		enterSystemOff();
+	}
+
+	delay(10);
+}

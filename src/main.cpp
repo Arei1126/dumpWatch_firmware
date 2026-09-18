@@ -1,0 +1,230 @@
+#include <Arduino.h>
+#include <bluefruit.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+namespace {
+constexpr uint8_t kScreenWidth = 128;
+constexpr uint8_t kScreenHeight = 64;
+constexpr uint8_t kDisplayAddress = 0x3C;
+constexpr uint8_t kImuAddress = 0x6A;
+constexpr uint8_t kImuInt1Pin = PIN_LSM6DS3TR_C_INT1;
+constexpr uint16_t kImageSize = 1024;
+constexpr uint32_t kReceiveTimeoutMs = 3000;
+constexpr uint32_t kAdvertisingTimeoutMs = 3000;
+constexpr uint32_t kDisplayTimeMs = 8000;
+
+constexpr char kServiceUuid[] = "7d5a0001-8f2a-4c7e-9b41-2c6b6b7a1001";
+constexpr char kRxCharacteristicUuid[] =
+    "7d5a0002-8f2a-4c7e-9b41-2c6b6b7a1001";
+
+Adafruit_SSD1306 display(kScreenWidth, kScreenHeight, &Wire, -1);
+BLEService imageService(kServiceUuid);
+BLECharacteristic imageCharacteristic(
+    kRxCharacteristicUuid,
+    CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP,
+    kImageSize);
+
+uint8_t rxBuffer[kImageSize];
+volatile uint16_t rxLength = 0;
+volatile bool rxComplete = false;
+volatile bool connectionChanged = false;
+volatile bool connected = false;
+
+uint32_t receiveStartedAt = 0;
+uint32_t advertisingStartedAt = 0;
+uint32_t displayStartedAt = 0;
+bool displayActive = false;
+volatile bool tapDetected = false;
+
+void onTapInterrupt() {
+  tapDetected = true;
+}
+
+void writeImuRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(kImuAddress);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
+}
+
+void initializeImu() {
+  pinMode(kImuInt1Pin, INPUT);
+
+  // Enable the accelerometer and configure the double-tap detector.
+  writeImuRegister(0x10, 0x50);  // CTRL1_XL: 208 Hz, +/-2 g.
+  writeImuRegister(0x58, 0x8D);  // TAP_CFG: detector and X/Y/Z axes enabled.
+  writeImuRegister(0x59, 0x08);  // TAP_THS_6D: conservative initial threshold.
+  writeImuRegister(0x5A, 0x06);  // INT_DUR2: double-tap timing window.
+  writeImuRegister(0x5E, 0x10);  // MD1_CFG: route double-tap to INT1.
+
+  attachInterrupt(digitalPinToInterrupt(kImuInt1Pin), onTapInterrupt, RISING);
+}
+
+void resetReceiveBuffer() {
+  noInterrupts();
+  rxLength = 0;
+  rxComplete = false;
+  interrupts();
+  receiveStartedAt = millis();
+}
+
+void onConnect(uint16_t) {
+  connected = true;
+  connectionChanged = true;
+  resetReceiveBuffer();
+}
+
+void onDisconnect(uint16_t, uint8_t) {
+  connected = false;
+  connectionChanged = true;
+  resetReceiveBuffer();
+}
+
+void onImageWritten(uint16_t, BLECharacteristic*, uint8_t* data, uint16_t len) {
+  if (len == 0 || rxComplete) {
+    return;
+  }
+
+  if (rxLength + len > kImageSize) {
+    rxLength = 0;
+    rxComplete = false;
+    return;
+  }
+
+  memcpy(rxBuffer + rxLength, data, len);
+  rxLength += len;
+  if (rxLength == kImageSize) {
+    rxComplete = true;
+  }
+}
+
+void startAdvertising() {
+  Bluefruit.Advertising.stop();
+  Bluefruit.Advertising.clearData();
+  Bluefruit.ScanResponse.clearData();
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addTxPower();
+  Bluefruit.Advertising.addService(imageService);
+  Bluefruit.ScanResponse.addName();
+  Bluefruit.Advertising.restartOnDisconnect(false);
+  Bluefruit.Advertising.start(0);
+  advertisingStartedAt = millis();
+}
+
+void showReceivedImage() {
+  uint8_t* displayBuffer = display.getBuffer();
+  noInterrupts();
+  memcpy(displayBuffer, rxBuffer, kImageSize);
+  rxComplete = false;
+  interrupts();
+
+  display.ssd1306_command(SSD1306_DISPLAYON);
+  display.display();
+  displayStartedAt = millis();
+  displayActive = true;
+  detachInterrupt(digitalPinToInterrupt(kImuInt1Pin));
+}
+
+void showTimeoutMessage() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(F("BLE TIMEOUT"));
+  display.println(F("NO IMAGE RECEIVED"));
+  display.display();
+  display.ssd1306_command(SSD1306_DISPLAYON);
+  displayStartedAt = millis();
+  displayActive = true;
+  detachInterrupt(digitalPinToInterrupt(kImuInt1Pin));
+}
+
+void turnDisplayOff() {
+  display.ssd1306_command(SSD1306_DISPLAYOFF);
+  displayActive = false;
+  attachInterrupt(digitalPinToInterrupt(kImuInt1Pin), onTapInterrupt, RISING);
+}
+
+}  // namespace
+
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin();
+  Wire.setClock(400000);
+  initializeImu();
+  if (!display.begin(SSD1306_SWITCHCAPVCC, kDisplayAddress)) {
+    while (true) {
+      delay(1000);
+    }
+  }
+  display.clearDisplay();
+  display.display();
+  turnDisplayOff();
+
+  Bluefruit.begin(1, 0);
+  Bluefruit.setName("Dumb Watch");
+  Bluefruit.Periph.setConnectCallback(onConnect);
+  Bluefruit.Periph.setDisconnectCallback(onDisconnect);
+
+  imageService.begin();
+  imageCharacteristic.setWriteCallback(onImageWritten);
+  imageCharacteristic.begin();
+
+  startAdvertising();
+  resetReceiveBuffer();
+}
+
+void loop() {
+  if (tapDetected) {
+    noInterrupts();
+    tapDetected = false;
+    interrupts();
+    if (displayActive) {
+      displayStartedAt = millis();
+    }
+  }
+
+  if (rxComplete && !displayActive) {
+    showReceivedImage();
+  }
+
+  if (connected && !rxComplete && !displayActive &&
+      millis() - receiveStartedAt >= kReceiveTimeoutMs) {
+    resetReceiveBuffer();
+    showTimeoutMessage();
+    if (Bluefruit.connected()) {
+      Bluefruit.disconnect(Bluefruit.connHandle());
+    }
+  }
+
+  if (!connected && !displayActive && Bluefruit.Advertising.isRunning() &&
+      millis() - advertisingStartedAt >= kAdvertisingTimeoutMs) {
+    Bluefruit.Advertising.stop();
+    resetReceiveBuffer();
+    showTimeoutMessage();
+  }
+
+  if (displayActive && millis() - displayStartedAt >= kDisplayTimeMs) {
+    turnDisplayOff();
+    if (Bluefruit.connected()) {
+      Bluefruit.disconnect(Bluefruit.connHandle());
+    }
+    startAdvertising();
+  }
+
+  if (connectionChanged) {
+    noInterrupts();
+    connectionChanged = false;
+    interrupts();
+    if (!connected && !displayActive) {
+      resetReceiveBuffer();
+      startAdvertising();
+    }
+  }
+
+  //delay(1);
+  waitForEvent();
+}

@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dumb Watch Web Bluetooth Test</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: system-ui, sans-serif;
+      background: #eef1f4;
+      color: #17212b;
+    }
+    body { max-width: 760px; margin: 0 auto; padding: 24px; }
+    main { background: white; padding: 24px; border: 1px solid #ccd4dc; border-radius: 8px; }
+    h1 { margin-top: 0; font-size: 1.4rem; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+    button { padding: 10px 14px; border: 1px solid #52606d; border-radius: 4px; background: #f7f9fa; cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: .5; }
+    canvas { width: 512px; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid #52606d; background: #000; }
+    label { display: block; margin: 12px 0 4px; font-weight: 600; }
+    input { width: 100%; box-sizing: border-box; padding: 9px; border: 1px solid #9aa7b2; border-radius: 4px; }
+    pre { min-height: 120px; max-height: 240px; overflow: auto; padding: 12px; background: #17212b; color: #d7f9e9; border-radius: 4px; white-space: pre-wrap; }
+    .status { padding: 8px 10px; background: #e8f0f7; border-left: 4px solid #3578b5; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Dumb Watch Web Bluetoothテスト</h1>
+  <p class="status" id="status">未接続</p>
+
+  <label for="message">テスト表示文字列</label>
+  <input id="message" value="DUMB WATCH TEST">
+
+  <div class="controls">
+    <button id="scan">時計をスキャンして接続</button>
+    <button id="send" disabled>現在の画像を送信</button>
+    <button id="sendPattern" disabled>境界テスト画像を送信</button>
+    <button id="disconnect" disabled>切断</button>
+  </div>
+
+  <canvas id="preview" width="128" height="64"></canvas>
+  <pre id="log" aria-live="polite"></pre>
+</main>
+<script>
+'use strict';
+
+const SERVICE_UUID = '7d5a0001-8f2a-4c7e-9b41-2c6b6b7a1001';
+const RX_UUID = '7d5a0002-8f2a-4c7e-9b41-2c6b6b7a1001';
+const IMAGE_SIZE = 1024;
+const FALLBACK_CHUNK_SIZE = 20;
+
+const statusElement = document.querySelector('#status');
+const logElement = document.querySelector('#log');
+const messageElement = document.querySelector('#message');
+const canvas = document.querySelector('#preview');
+const context = canvas.getContext('2d', { willReadFrequently: true });
+const scanButton = document.querySelector('#scan');
+const sendButton = document.querySelector('#send');
+const patternButton = document.querySelector('#sendPattern');
+const disconnectButton = document.querySelector('#disconnect');
+
+let device = null;
+let server = null;
+let rxCharacteristic = null;
+let effectiveMtu = 23;
+let lastFrame = null;
+
+function log(message) {
+  const timestamp = new Date().toLocaleTimeString();
+  logElement.textContent += `[${timestamp}] ${message}\n`;
+  logElement.scrollTop = logElement.scrollHeight;
+}
+
+function setStatus(message) {
+  statusElement.textContent = message;
+}
+
+function setConnectedState(isConnected) {
+  sendButton.disabled = !isConnected;
+  patternButton.disabled = !isConnected;
+  disconnectButton.disabled = !isConnected;
+}
+
+function drawPreview() {
+  context.fillStyle = '#000';
+  context.fillRect(0, 0, 128, 64);
+  context.fillStyle = '#fff';
+  context.font = '10px monospace';
+  context.fillText(messageElement.value.slice(0, 21), 2, 12);
+  context.fillRect(2, 20, 124, 1);
+  context.fillText(new Date().toLocaleTimeString(), 2, 34);
+  context.fillText('WEB BLUETOOTH', 2, 50);
+  context.fillText('128 x 64 / 1BIT', 2, 62);
+}
+
+function bitmapToSsd1306Bytes() {
+  const pixels = context.getImageData(0, 0, 128, 64).data;
+  const output = new Uint8Array(IMAGE_SIZE);
+  for (let y = 0; y < 64; y += 1) {
+    for (let x = 0; x < 128; x += 1) {
+      const pixelIndex = (y * 128 + x) * 4;
+      const luminance = (pixels[pixelIndex] + pixels[pixelIndex + 1] + pixels[pixelIndex + 2]) / 3;
+      if (luminance >= 128) {
+        const pageIndex = Math.floor(y / 8);
+        output[pageIndex * 128 + x] |= 1 << (y % 8);
+      }
+    }
+  }
+  return output;
+}
+
+function makeBoundaryTestFrame() {
+  const output = new Uint8Array(IMAGE_SIZE);
+  output[0] = 0x01;       // (0, 0)
+  output[0] |= 0x80;      // (0, 7)
+  output[128] = 0x01;     // (0, 8)
+  output[1023] = 0x80;    // (127, 63)
+  return output;
+}
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    throw new Error('このブラウザはWeb Bluetooth APIに対応していません');
+  }
+  device = await navigator.bluetooth.requestDevice({
+    filters: [{ services: [SERVICE_UUID] }],
+    optionalServices: [SERVICE_UUID]
+  });
+  device.addEventListener('gattserverdisconnected', handleDisconnected);
+  setStatus(`${device.name || 'Dumb Watch'}に接続中...`);
+  server = await device.gatt.connect();
+  const service = await server.getPrimaryService(SERVICE_UUID);
+  rxCharacteristic = await service.getCharacteristic(RX_UUID);
+  // Linux Chrome may keep ATT MTU 23 when no explicit MTU negotiation is exposed.
+  // Use the conservative payload size (23 - 3) to avoid rejecting the first write.
+  effectiveMtu = 23;
+  log(`接続: ${device.name || '(名称なし)'}`);
+  log(`実効MTUの前提: ${effectiveMtu}、チャンク: ${effectiveMtu - 3} bytes`);
+  setStatus('接続済み');
+  setConnectedState(true);
+  // 現行ファームウェアは接続時点から約3秒で受信timeoutになるため、
+  // 接続確認後すぐにテスト画像を送信する。
+  drawPreview();
+  await sendFrame(bitmapToSsd1306Bytes());
+}
+
+function handleDisconnected() {
+  setConnectedState(false);
+  setStatus('未接続');
+  log('切断されました');
+  server = null;
+  rxCharacteristic = null;
+}
+
+async function sendFrame(frame) {
+  if (!rxCharacteristic) {
+    throw new Error('RX Characteristicに接続されていません');
+  }
+  if (frame.length !== IMAGE_SIZE) {
+    throw new Error(`画像サイズが${IMAGE_SIZE}バイトではありません`);
+  }
+  const chunkSize = FALLBACK_CHUNK_SIZE;
+  const useWithoutResponse = rxCharacteristic.properties.writeWithoutResponse;
+  const writeType = useWithoutResponse ? 'Write Without Response' : 'Write';
+  log(`${writeType}で${frame.length} bytesを${chunkSize} bytes単位で送信`);
+  setStatus('画像送信中...');
+
+  for (let offset = 0; offset < frame.length; offset += chunkSize) {
+    const chunk = frame.slice(offset, Math.min(offset + chunkSize, frame.length));
+    if (useWithoutResponse) {
+      await rxCharacteristic.writeValueWithoutResponse(chunk);
+    } else {
+      await rxCharacteristic.writeValue(chunk);
+    }
+    // Write Without Responseを連続発行しすぎないための小さな間隔。
+    if (useWithoutResponse) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+  }
+  await new Promise(resolve => setTimeout(resolve, 100));
+  lastFrame = frame;
+  setStatus('送信完了。時計の表示を確認してください');
+  log('1024 bytesの送信完了');
+}
+
+scanButton.addEventListener('click', async () => {
+  try {
+    scanButton.disabled = true;
+    await connect();
+  } catch (error) {
+    setStatus('接続失敗');
+    log(`エラー: ${error.message}`);
+    setConnectedState(false);
+  } finally {
+    scanButton.disabled = false;
+  }
+});
+
+sendButton.addEventListener('click', async () => {
+  try {
+    drawPreview();
+    await sendFrame(bitmapToSsd1306Bytes());
+  } catch (error) {
+    setStatus('送信失敗');
+    log(`エラー: ${error.message}`);
+  }
+});
+
+patternButton.addEventListener('click', async () => {
+  try {
+    await sendFrame(makeBoundaryTestFrame());
+  } catch (error) {
+    setStatus('送信失敗');
+    log(`エラー: ${error.message}`);
+  }
+});
+
+disconnectButton.addEventListener('click', () => {
+  if (device?.gatt?.connected) {
+    device.gatt.disconnect();
+  }
+});
+
+messageElement.addEventListener('input', drawPreview);
+drawPreview();
+setConnectedState(false);
+log('準備完了。localhostまたはHTTPSで開いてください。');
+</script>
+</body>
+</html>

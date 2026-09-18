@@ -23,7 +23,6 @@ constexpr uint8_t kImuAddress = 0x6A;
 constexpr uint8_t kImuInt1Pin = PIN_LSM6DS3TR_C_INT1;
 
 constexpr uint16_t kImageSize = 1024;
-constexpr uint16_t kBleChunkSize = 244;
 
 constexpr uint32_t kReceiveTimeoutMs = 3000;
 
@@ -51,7 +50,7 @@ BLECharacteristic imageCharacteristic(
 
     CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP,
 
-    kBleChunkSize);
+    kImageSize);
 
 
 
@@ -341,16 +340,11 @@ void setup() {
 
 
 
-  const err_t serviceResult = imageService.begin();
+  imageService.begin();
 
   imageCharacteristic.setWriteCallback(onImageWritten);
 
-  const err_t characteristicResult = imageCharacteristic.begin();
-
-  Serial.print(F("Service begin: 0x"));
-  Serial.println(serviceResult, HEX);
-  Serial.print(F("Characteristic begin: 0x"));
-  Serial.println(characteristicResult, HEX);
+  imageCharacteristic.begin();
 
 
 
